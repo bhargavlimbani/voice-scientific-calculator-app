@@ -1,149 +1,92 @@
-import 'dart:math';
+import 'dart:math' as math;
+import 'package:math_expressions/math_expressions.dart';
 
 class SmartCalculator {
   static double evaluate(String input) {
-    String expr = input.toLowerCase();
-
-    expr = expr.replaceAll("plus", "+");
-    expr = expr.replaceAll("minus", "-");
-    expr = expr.replaceAll("times", "*");
-    expr = expr.replaceAll("multiplied by", "*");
-    expr = expr.replaceAll("divided by", "/");
-    expr = expr.replaceAll("divided", "/");
-
-    expr = expr.replaceAll("pi", pi.toString());
-    expr = expr.replaceAll("e", e.toString());
-
-    expr = expr.replaceAll("square root", "sqrt");
-    expr = expr.replaceAll("power", "^");
-
     try {
-      return _process(expr);
+      String expr = _prepareExpression(input);
+      print("Final Expr for Parser: $expr");
+
+      Parser p = Parser();
+      Expression exp = p.parse(expr);
+      ContextModel cm = ContextModel();
+
+      double result = exp.evaluate(EvaluationType.REAL, cm);
+
+      if (result.isNaN || result.isInfinite) {
+        throw Exception("Calculation Error");
+      }
+
+      if (result.abs() < 1e-12) result = 0;
+
+      return result;
     } catch (e) {
+      print("Eval Error: $e");
       throw Exception("Invalid Expression");
     }
   }
 
-  static double _process(String expr) {
-    expr = expr.replaceAll(" ", "");
+  static String _prepareExpression(String input) {
+    String text = input.toLowerCase().replaceAll(" ", "");
     
+    // Basic Mappings
+    text = text.replaceAll("×", "*");
+    text = text.replaceAll("÷", "/");
+    text = text.replaceAll("π", math.pi.toString());
+    text = text.replaceAll("e", math.e.toString());
+    text = text.replaceAll("√", "sqrt");
 
-    // sin cos tan (degree)
-    expr = expr.replaceAllMapped(
-        RegExp(r'sin(\d+)'), (m) => sin(_deg(double.parse(m[1]!))).toString());
-
-    expr = expr.replaceAllMapped(
-        RegExp(r'cos(\d+)'), (m) => cos(_deg(double.parse(m[1]!))).toString());
-
-    expr = expr.replaceAllMapped(
-        RegExp(r'tan(\d+)'), (m) => tan(_deg(double.parse(m[1]!))).toString());
-
-    // log
-    expr = expr.replaceAllMapped(RegExp(r'log(\d+)'),
-        (m) => (log(double.parse(m[1]!)) / ln10).toString());
-
-    // ln
-    expr = expr.replaceAllMapped(
-        RegExp(r'ln(\d+)'), (m) => log(double.parse(m[1]!)).toString());
-
-    // sqrt
-    expr = expr.replaceAllMapped(
-        RegExp(r'sqrt(\d+)'), (m) => sqrt(double.parse(m[1]!)).toString());
-
-    // factorial
-    expr = expr.replaceAllMapped(
-        RegExp(r'(\d+)!'), (m) => _factorial(int.parse(m[1]!)).toString());
-
-    // power
-    expr = expr.replaceAllMapped(RegExp(r'(\d+)\^(\d+)'),
-        (m) => pow(double.parse(m[1]!), double.parse(m[2]!)).toString());
-
-    // percentage
-    expr = expr.replaceAllMapped(RegExp(r'(\d+)%'), (m) => "(${m[1]}/100)");
-
-    // Add before evaluation
-
-    expr = expr.replaceAll("square of", "");
-    expr = expr.replaceAll("cube of", "");
-
-    expr = expr.replaceAllMapped(
-        RegExp(r'square(\d+)'), (m) => pow(double.parse(m[1]!), 2).toString());
-
-    expr = expr.replaceAllMapped(
-        RegExp(r'cube(\d+)'), (m) => pow(double.parse(m[1]!), 3).toString());
-
-// percentage smart
-    expr = expr.replaceAllMapped(RegExp(r'(\d+)\+(\d+)%'), (m) {
-      double a = double.parse(m[1]!);
-      double b = double.parse(m[2]!);
-      return (a + (a * b / 100)).toString();
+    // Handle Factorials
+    text = text.replaceAllMapped(RegExp(r'(\d+)!'), (m) {
+      int n = int.parse(m[1]!);
+      return n > 20 ? "1.0e10" : _calculateFactorial(n).toString();
     });
 
-    return _calculate(expr);
-  }
+    // --- ENHANCED PERCENTAGE LOGIC ---
+    // Handle 'X % Y' as 'X percent of Y' -> (X/100)*Y
+    text = text.replaceAllMapped(RegExp(r'(\d+\.?\d*)%(\d+\.?\d*)'), (m) => "((${m[1]}/100)*${m[2]})");
+    
+    // Handle 'X %' as 'X / 100'
+    text = text.replaceAllMapped(RegExp(r'(\d+\.?\d*)%'), (m) => "(${m[1]}/100)");
+    
+    // Safety: If % is left alone by mistake, remove it to prevent crash
+    text = text.replaceAll("%", "");
 
-  static double _calculate(String expr) {
-    List<String> tokens = _tokenize(expr);
-    return _solve(tokens);
-  }
-
-  static List<String> _tokenize(String expr) {
-    List<String> tokens = [];
-    String num = "";
-
-    for (int i = 0; i < expr.length; i++) {
-      String ch = expr[i];
-
-      if ("0123456789.".contains(ch)) {
-        num += ch;
-      } else {
-        if (num.isNotEmpty) {
-          tokens.add(num);
-          num = "";
-        }
-        tokens.add(ch);
-      }
+    // Handle missing brackets for scientific functions
+    List<String> funcs = ['sin', 'cos', 'tan', 'log', 'ln', 'sqrt'];
+    for (var f in funcs) {
+      text = text.replaceAllMapped(RegExp('$f(\\d+\\.?\\d*)'), (m) => "$f(${m[1]})");
     }
 
-    if (num.isNotEmpty) tokens.add(num);
-    return tokens;
-  }
-
-  static double _solve(List<String> tokens) {
-    // *, /
-    for (int i = 0; i < tokens.length; i++) {
-      if (tokens[i] == "*" || tokens[i] == "/") {
-        double a = double.parse(tokens[i - 1]);
-        double b = double.parse(tokens[i + 1]);
-
-        double res = tokens[i] == "*" ? a * b : a / b;
-
-        tokens.removeRange(i - 1, i + 2);
-        tokens.insert(i - 1, res.toString());
-        i--;
-      }
+    // Nesting Logic for Log and Trig
+    while (text.contains("log(")) {
+      String newText = text.replaceAllMapped(RegExp(r'log\(([^()]+)\)'), (m) => "(ln(${m[1]})/ln(10.0))");
+      if (newText == text) break;
+      text = newText;
+    }
+    while (text.contains("sin(")) {
+      String newText = text.replaceAllMapped(RegExp(r'sin\(([^()]+)\)'), (m) => "sin((${math.pi}/180.0)*(${m[1]}))");
+      if (newText == text) break;
+      text = newText;
+    }
+    while (text.contains("cos(")) {
+      String newText = text.replaceAllMapped(RegExp(r'cos\(([^()]+)\)'), (m) => "cos((${math.pi}/180.0)*(${m[1]}))");
+      if (newText == text) break;
+      text = newText;
+    }
+    while (text.contains("tan(")) {
+      String newText = text.replaceAllMapped(RegExp(r'tan\(([^()]+)\)'), (m) => "tan((${math.pi}/180.0)*(${m[1]}))");
+      if (newText == text) break;
+      text = newText;
     }
 
-    // +, -
-    double result = double.parse(tokens[0]);
-
-    for (int i = 1; i < tokens.length; i += 2) {
-      double val = double.parse(tokens[i + 1]);
-
-      if (tokens[i] == "+") {
-        result += val;
-      } else {
-        result -= val;
-      }
-    }
-
-    return result;
+    return text;
   }
 
-  static double _deg(double val) => val * pi / 180;
-
-  static int _factorial(int n) {
-    if (n <= 1) return 1;
-    return n * _factorial(n - 1);
+  static double _calculateFactorial(int n) {
+    if (n < 0) return 0;
+    double res = 1;
+    for (int i = 2; i <= n; i++) res *= i;
+    return res;
   }
 }

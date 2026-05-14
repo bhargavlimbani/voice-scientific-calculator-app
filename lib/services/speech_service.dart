@@ -19,7 +19,6 @@ class SpeechService {
   }
 
   void startListening(Function(String, bool) onResult) async {
-    // 🔥 Always stop previous session
     if (_speech.isListening) {
       await _speech.stop();
     }
@@ -28,10 +27,11 @@ class SpeechService {
       onResult: (val) {
         onResult(val.recognizedWords, val.finalResult);
       },
-      listenFor: const Duration(seconds: 10),
-      pauseFor: const Duration(seconds: 2),
+      listenFor: const Duration(seconds: 30), // Increased to 30 seconds
+      pauseFor: const Duration(seconds: 5),  // Increased to 5 seconds for long breaths
       partialResults: true,
-      cancelOnError: true,
+      cancelOnError: false, // Don't stop on minor errors
+      onDevice: true, 
     );
   }
 
