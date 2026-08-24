@@ -7,7 +7,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../services/speech_service.dart';
 import '../services/tts_service.dart';
 import '../calculator/smart_calculator.dart';
-import '../ai/ai_parser.dart';
+import '../ai/llm_parser.dart';
+import '../config/api_config.dart';
+import '../ai/parse_cache.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -27,13 +29,21 @@ class _HomeScreenState extends State<HomeScreen> {
   List<Map<String, String>> history = [];
   Timer? _typeTimer;
 
+  // --- AI state ---
+  List<String> steps = [];   // step-by-step working from the LLM
+  String errorHint = "";     // friendly error + suggestion
+  ParseSource source = ParseSource.offline; // which brain answered last
+  bool hasKey = false;       // an API key is configured
+
   final List<String> examples = [
-    "What is log of log 1000?",
-    "Sine 90 plus square root 16",
-    "Add 50 to 100",
+    "Twenty five plus thirty two times two",
+    "A shirt costs 800, add 18% GST",
+    "Sine 90 plus square root of 16",
+    "Saat sau ka pandrah pratishat",
+    "બાર ગુણ્યા આઠ",
+    "Convert 5 kilometres into metres",
+    "Cube root of 27 plus 2 to the power 5",
     "What is 5 factorial?",
-    "Tangent 45 times 10",
-    "Square root of 144",
   ];
 
   @override
@@ -41,6 +51,12 @@ class _HomeScreenState extends State<HomeScreen> {
     super.initState();
     _initSpeech();
     _loadHistory();
+    _loadKey();
+  }
+
+  void _loadKey() async {
+    await ApiConfig.load();
+    if (mounted) setState(() => hasKey = ApiConfig.hasKey);
   }
 
   @override
@@ -222,28 +238,112 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
+  /// The enhanced pipeline:
+  ///   speech/text -> LLMParser (prompt engineering) -> SmartCalculator (local)
+  /// The LLM only understands the sentence; the number is always computed
+  /// on device, so a wrong answer cannot be invented by the model.
   void process(String text) async {
-    if (text.isEmpty) return;
+    if (text.trim().isEmpty) return;
     speech.stop();
-    setState(() { isListening = false; result = "Calculating..."; input = text; });
-    try {
-      String aiText = AIParser.process(text);
-      double res = SmartCalculator.evaluate(aiText);
-      String lang = detectLanguage(text);
-      setState(() {
-        result = res.toString().replaceAll(".0", "");
-        _addToHistory(text, result);
-      });
-      tts.stop().then((_) => tts.speak(speakText(result, lang), lang));
-    } catch (e) {
-      setState(() => result = "Error");
+    setState(() {
+      isListening = false;
+      result = hasKey ? "Thinking..." : "Calculating...";
+      input = text;
+      steps = [];
+      errorHint = "";
+    });
+
+    // Keypad input is already valid maths - never spend an API call on it.
+    if (_isPureExpression(text)) {
+      try {
+        final display = _formatNumber(SmartCalculator.evaluate(text));
+        final lang = detectLanguage(text);
+        setState(() {
+          result = display;
+          source = ParseSource.offline;
+          _addToHistory(text, display);
+        });
+        tts.stop().then((_) => tts.speak(speakText(display, lang), lang));
+      } catch (e) {
+        setState(() {
+          result = "Error";
+          errorHint = "Check the brackets and operators.";
+        });
+      }
+      return;
     }
+
+    final parsed = await LLMParser.parse(text);
+    if (!mounted) return;
+
+    // The model understood the words but it is not a maths question.
+    if (!parsed.isValid) {
+      setState(() {
+        result = "?";
+        source = parsed.source;
+        errorHint = parsed.suggestion.isEmpty
+            ? parsed.errorMessage
+            : "${parsed.errorMessage}  ${parsed.suggestion}";
+      });
+      tts.stop().then((_) => tts.speak(parsed.errorMessage, parsed.language));
+      return;
+    }
+
+    String display;
+    try {
+      display = _formatNumber(SmartCalculator.evaluate(parsed.expression));
+    } catch (e) {
+      // Local evaluation failed. Use the model's own answer if it gave one.
+      if (parsed.usedAI && (parsed.answer ?? "").trim().isNotEmpty) {
+        display = parsed.answer!.trim();
+      } else {
+        setState(() {
+          result = "Error";
+          source = parsed.source;
+          errorHint = parsed.usedAI
+              ? "Could not evaluate: ${parsed.expression}"
+              : "Offline mode could not understand this. Add an API key for full AI parsing.";
+        });
+        return;
+      }
+    }
+
+    setState(() {
+      result = display;
+      steps = parsed.steps;
+      source = parsed.source;
+      _addToHistory(text, display);
+    });
+    tts.stop().then((_) =>
+        tts.speak(speakText(display, parsed.language), parsed.language));
+  }
+
+  /// True when the text is already a maths expression (typed on the keypad),
+  /// so it can go straight to the evaluator without a network round trip.
+  bool _isPureExpression(String t) {
+    final stripped = t
+        .toLowerCase()
+        .replaceAll(RegExp(r'sin|cos|tan|log|ln|sqrt|abs'), '');
+    return RegExp(r'[0-9]').hasMatch(t) &&
+        RegExp(r'^[0-9+\-*/^().!%√π\s]*$').hasMatch(stripped);
+  }
+
+  /// 12.0 -> "12", 0.4771212547 -> "0.477121". Replaces the old
+  /// replaceAll(".0", "") which corrupted numbers like 1.05 into 15.
+  String _formatNumber(double v) {
+    if (v == v.roundToDouble() && v.abs() < 1e15) return v.toInt().toString();
+    String s = v.toStringAsFixed(6);
+    if (s.contains('.')) {
+      s = s.replaceAll(RegExp(r'0+$'), '');
+      s = s.replaceAll(RegExp(r'\.$'), '');
+    }
+    return s;
   }
 
   void onButtonPress(String value) {
     _typeTimer?.cancel();
     setState(() {
-      if (value == "C") { input = ""; result = "0"; }
+      if (value == "C") { input = ""; result = "0"; steps = []; errorHint = ""; }
       else if (value == "⌫") { if (input.isNotEmpty) input = input.substring(0, input.length - 1); }
       else if (value == "=") { process(input); }
       else { input += value; }
@@ -361,8 +461,159 @@ class _HomeScreenState extends State<HomeScreen> {
               IconButton(icon: const Icon(Icons.keyboard, color: Colors.blueAccent, size: 20), onPressed: () => _showKeyboardInput(initialText: input)),
             ],
           ),
-          IconButton(icon: const Icon(Icons.history, color: Colors.white54, size: 20), onPressed: _showHistory),
+          _buildAIBadge(),
+          Row(
+            children: [
+              IconButton(icon: Icon(hasKey ? Icons.key : Icons.key_off, color: hasKey ? Colors.greenAccent : Colors.white38, size: 20), onPressed: _showKeyDialog),
+              IconButton(icon: const Icon(Icons.history, color: Colors.white54, size: 20), onPressed: _showHistory),
+            ],
+          ),
         ],
+      ),
+    );
+  }
+
+  /// Shows which brain answered: live model, learnt cache, or offline rules.
+  Widget _buildAIBadge() {
+    late final Color c;
+    late final IconData icon;
+    late final String label;
+    switch (source) {
+      case ParseSource.ai:
+        c = Colors.greenAccent;
+        icon = Icons.auto_awesome;
+        label = "AI";
+        break;
+      case ParseSource.cache:
+        c = Colors.amberAccent;
+        icon = Icons.bolt;
+        label = "Learnt";
+        break;
+      case ParseSource.offline:
+        c = Colors.white38;
+        icon = Icons.offline_bolt;
+        label = "Offline";
+        break;
+    }
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      decoration: BoxDecoration(
+        color: c.withOpacity(0.15),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: c.withOpacity(0.4)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 12, color: c),
+          const SizedBox(width: 5),
+          Text(label,
+              style: TextStyle(
+                  fontSize: 11, fontWeight: FontWeight.bold, color: c)),
+        ],
+      ),
+    );
+  }
+
+  void _showKeyDialog() async {
+    final controller = TextEditingController(text: ApiConfig.apiKey);
+    final int learnt = await ParseCache.size();
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF1A1A2E),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: Text(
+            hasKey ? "API Key (${ApiConfig.providerName})" : "API Key",
+            style: const TextStyle(color: Colors.white, fontSize: 18)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: controller,
+              autofocus: true,
+              obscureText: true,
+              style: const TextStyle(color: Colors.white, fontSize: 13),
+              decoration: const InputDecoration(
+                hintText: "Gemini or Claude key",
+                hintStyle: TextStyle(color: Colors.white24),
+                enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
+                focusedBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.blueAccent)),
+              ),
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              "The provider is detected from the key. Without a key the app still works offline using the built-in rule based parser.",
+              style: TextStyle(color: Colors.white38, fontSize: 11),
+            ),
+            const SizedBox(height: 14),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text("Learnt phrases: $learnt",
+                    style: const TextStyle(color: Colors.amberAccent, fontSize: 11)),
+                GestureDetector(
+                  onTap: () async {
+                    await ParseCache.clear();
+                    if (!context.mounted) return;
+                    Navigator.pop(context);
+                  },
+                  child: const Text("Clear",
+                      style: TextStyle(color: Colors.white38, fontSize: 11)),
+                ),
+              ],
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () async {
+              await ApiConfig.save("");
+              if (!context.mounted) return;
+              Navigator.pop(context);
+              setState(() => hasKey = false);
+            },
+            child: const Text("Remove", style: TextStyle(color: Colors.redAccent)),
+          ),
+          ElevatedButton(
+            onPressed: () async {
+              await ApiConfig.save(controller.text);
+              if (!context.mounted) return;
+              Navigator.pop(context);
+              setState(() => hasKey = ApiConfig.hasKey);
+            },
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.blueAccent, foregroundColor: Colors.white),
+            child: const Text("Save"),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Step-by-step working produced by the chain-of-thought part of the prompt.
+  Widget _buildStepsPanel() {
+    return Container(
+      margin: const EdgeInsets.only(top: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      constraints: const BoxConstraints(maxHeight: 96),
+      decoration: BoxDecoration(
+        color: Colors.blueAccent.withOpacity(0.06),
+        borderRadius: BorderRadius.circular(12),
+        border: Border(left: BorderSide(color: Colors.blueAccent.withOpacity(0.6), width: 3)),
+      ),
+      child: SingleChildScrollView(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: steps
+              .map((s) => Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 2),
+                    child: Text("• $s",
+                        style: const TextStyle(color: Colors.white70, fontSize: 12)),
+                  ))
+              .toList(),
+        ),
       ),
     );
   }
@@ -387,12 +638,24 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             const SizedBox(height: 4),
             FittedBox(
-              fit: BoxFit.scaleDown, 
+              fit: BoxFit.scaleDown,
               child: Text(
-                result, 
+                result,
                 style: const TextStyle(color: Colors.white, fontSize: 42, fontWeight: FontWeight.bold)
               )
             ),
+            if (errorHint.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Text(
+                  errorHint,
+                  textAlign: TextAlign.right,
+                  maxLines: 3,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: Colors.orangeAccent, fontSize: 12),
+                ),
+              ),
+            if (steps.isNotEmpty) _buildStepsPanel(),
           ],
         ),
       ),
